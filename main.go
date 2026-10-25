@@ -8,7 +8,9 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	_ "embed"
+	"errors"
 	"fmt"
+	"io/fs"
 	"math/big"
 	"net"
 	"net/http"
@@ -29,6 +31,7 @@ type BuildCmd struct {
 	Clean  bool   `help:"Remove dist before building."`
 	GOOS   string `name:"os" help:"Target GOOS (defaults to current Go environment)."`
 	GOARCH string `name:"arch" help:"Target GOARCH (defaults to current Go environment)."`
+	UseZig bool   `name:"use-zig" help:"Use zig as the C compiler for cgo."`
 }
 
 func (c *BuildCmd) Run() error {
@@ -52,16 +55,17 @@ func (c *BuildCmd) Run() error {
 		goarch = goEnv(projectRoot, "GOARCH")
 	}
 
-	buildNative(projectRoot, goos, goarch)
+	buildNative(projectRoot, goos, goarch, c.UseZig)
 
 	return nil
 }
 
-type BuildWasmCmd struct {
-	Clean bool `help:"Remove dist before building."`
+type BuildWebCmd struct {
+	Clean       bool `help:"Remove dist before building."`
+	SkipWasmOpt bool `name:"skip-wasm-opt" help:"Do not optimize main.wasm with wasm-opt."`
 }
 
-func (c *BuildWasmCmd) Run() error {
+func (c *BuildWebCmd) Run() error {
 	projectRoot, err := os.Getwd()
 	if err != nil {
 		return err
@@ -73,8 +77,42 @@ func (c *BuildWasmCmd) Run() error {
 		cleanDist(projectRoot)
 	}
 
-	buildWasm(projectRoot)
+	buildWasm(projectRoot, !c.SkipWasmOpt)
 
+	return nil
+}
+
+type PgoCmd struct {
+	Duration time.Duration `help:"How long to run the game offscreen." default:"30s"`
+}
+
+func (c *PgoCmd) Run() error {
+	projectRoot, err := os.Getwd()
+	if err != nil {
+		return err
+	}
+
+	projectRoot = ensureGoProject(projectRoot)
+
+	// write to a temporary file first, so a failed run keeps the previous profile
+	profile := filepath.Join(projectRoot, "default.pgo")
+	tmpProfile := profile + ".tmp"
+
+	env := os.Environ()
+	env = setEnv(env, "BYKE_CPUPROFILE", tmpProfile)
+	env = setEnv(env, "BYKE_OFFSCREEN_DURATION", c.Duration.String())
+
+	fmt.Printf("Running offscreen for %s\n", c.Duration)
+	if err := run([]string{"go", "run", "."}, projectRoot, env); err != nil {
+		_ = os.Remove(tmpProfile)
+		return fmt.Errorf("run game: %w", err)
+	}
+
+	if err := os.Rename(tmpProfile, profile); err != nil {
+		return err
+	}
+
+	fmt.Printf("Wrote %s\n", profile)
 	return nil
 }
 
@@ -106,7 +144,8 @@ func (c *ServeWebCmd) Run() error {
 		if r.URL.Path == "/" || r.URL.Path == "/index.html" {
 			fmt.Printf("Building wasm for %s\n", r.URL.Path)
 
-			if err := buildWasmErr(projectRoot); err != nil {
+			// skip wasm-opt to keep reloads fast
+			if err := buildWasmErr(projectRoot, false); err != nil {
 				http.Error(w, fmt.Sprintf("build failed: %v", err), http.StatusInternalServerError)
 				return
 			}
@@ -171,9 +210,10 @@ func selfSignedCert(addr string) (tls.Certificate, error) {
 }
 
 var cli struct {
-	Build     BuildCmd     `cmd:"" help:"Build native binary."`
-	BuildWasm BuildWasmCmd `cmd:"build-wasm" help:"Build WebAssembly version."`
-	ServeWeb  ServeWebCmd  `cmd:"serve-web" help:"Serve the WebAssembly version, rebuilding on each reload."`
+	Build    BuildCmd    `cmd:"" help:"Build native binary."`
+	BuildWeb BuildWebCmd `cmd:"build-web" help:"Build WebAssembly version."`
+	ServeWeb ServeWebCmd `cmd:"serve-web" help:"Serve the WebAssembly version, rebuilding on each reload."`
+	Pgo      PgoCmd      `cmd:"" help:"Run the game offscreen natively and write a CPU profile to default.pgo."`
 }
 
 func main() {
@@ -248,6 +288,8 @@ func copyAssets(projectRoot, destination string) error {
 	if info, err := os.Stat(assets); err != nil || !info.IsDir() {
 		return nil
 	}
+
+	fmt.Println("Copy assets")
 	return copyDir(assets, filepath.Join(destination, "assets"))
 }
 
@@ -318,7 +360,7 @@ func setEnv(env []string, key, value string) []string {
 	return append(env, prefix+value)
 }
 
-func buildNative(projectRoot, goos, goarch string) {
+func buildNative(projectRoot, goos, goarch string, useZig bool) {
 	outDir := filepath.Join(projectRoot, "dist", fmt.Sprintf("%s-%s", goos, goarch))
 	if err := os.MkdirAll(outDir, 0o755); err != nil {
 		fmt.Fprintln(os.Stderr, "error:", err)
@@ -326,10 +368,13 @@ func buildNative(projectRoot, goos, goarch string) {
 	}
 
 	env := os.Environ()
-	env = setupZigCCEnv(env, goos, goarch)
+	if useZig {
+		env = setupZigCCEnv(env, goos, goarch)
+	}
 	env = setEnv(env, "GOOS", goos)
 	env = setEnv(env, "GOARCH", goarch)
 
+	fmt.Println("Building application")
 	checkRun([]string{"go", "build", "-o", outDir, "."}, projectRoot, env)
 
 	if err := copyAssets(projectRoot, outDir); err != nil {
@@ -338,14 +383,14 @@ func buildNative(projectRoot, goos, goarch string) {
 	}
 }
 
-func buildWasm(projectRoot string) {
-	if err := buildWasmErr(projectRoot); err != nil {
+func buildWasm(projectRoot string, optimize bool) {
+	if err := buildWasmErr(projectRoot, optimize); err != nil {
 		fmt.Fprintln(os.Stderr, "error:", err)
 		os.Exit(1)
 	}
 }
 
-func buildWasmErr(projectRoot string) error {
+func buildWasmErr(projectRoot string, optimize bool) error {
 	outDir := filepath.Join(projectRoot, "dist", "wasm")
 	if err := os.MkdirAll(outDir, 0o755); err != nil {
 		return err
@@ -354,19 +399,46 @@ func buildWasmErr(projectRoot string) error {
 	env := os.Environ()
 	env = setEnv(env, "GOOS", "js")
 	env = setEnv(env, "GOARCH", "wasm")
+	env = setEnv(env, "CGO_ENABLED", "0")
 
-	if err := run([]string{"go", "build", "-o", filepath.Join(outDir, "main.wasm"), "."}, projectRoot, env); err != nil {
+	mainWasm := filepath.Join(outDir, "main.wasm")
+	fmt.Println("Building application")
+	if err := run([]string{"go", "build", "-o", mainWasm, "."}, projectRoot, env); err != nil {
 		return err
+	}
+
+	if optimize {
+		fmt.Println("Optimizing wasm")
+
+		// enable the wasm features the Go compiler emits, so wasm-opt accepts the input,
+		// and simd so wasm-opt may use it
+		cmd := []string{
+			"wasm-opt", "-O2",
+			"--enable-bulk-memory", "--enable-nontrapping-float-to-int", "--enable-sign-ext", "--enable-simd",
+			mainWasm, "-o", mainWasm,
+		}
+		if err := run(cmd, projectRoot, env); err != nil {
+			return fmt.Errorf("wasm-opt: %w", err)
+		}
 	}
 
 	goroot := goEnv(projectRoot, "GOROOT")
 
+	fmt.Println("Copy helper files")
 	wasmExec := filepath.Join(goroot, "lib", "wasm", "wasm_exec.js")
 	if err := copyFile(wasmExec, filepath.Join(outDir, "wasm_exec.js"), 0o644); err != nil {
 		return err
 	}
 
-	if err := os.WriteFile(filepath.Join(outDir, "index.html"), indexHTML, 0o644); err != nil {
+	html, err := os.ReadFile(filepath.Join(projectRoot, "index.html"))
+	if errors.Is(err, fs.ErrNotExist) {
+		html, err = indexHTML, nil
+	}
+	if err != nil {
+		return err
+	}
+
+	if err := os.WriteFile(filepath.Join(outDir, "index.html"), html, 0o644); err != nil {
 		return err
 	}
 

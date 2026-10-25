@@ -9,6 +9,29 @@
         html, body {
             margin: 0;
             padding: 0;
+            background: black;
+        }
+
+        /* z-index -1 keeps the spinner behind the canvas once the app adds it */
+        #loading {
+            position: fixed;
+            top: 50%;
+            left: 50%;
+            z-index: -1;
+            width: 48px;
+            height: 48px;
+            margin: -24px 0 0 -24px;
+            box-sizing: border-box;
+            border: 4px solid rgba(255, 255, 255, 0.2);
+            border-top-color: white;
+            border-radius: 50%;
+            animation: spin 1s linear infinite;
+        }
+
+        @keyframes spin {
+            to {
+                transform: rotate(360deg);
+            }
         }
 
         canvas {
@@ -23,7 +46,7 @@
 
         async function main() {
             const go = new Go();
-ze
+
             WebAssembly.instantiateStreaming(fetch("main.wasm"), go.importObject).then(async (result) => {
                 wasm = result;
                 await go.run(result.instance);
@@ -33,5 +56,7 @@ ze
         void main()
     </script>
 </head>
-<body></body>
+<body>
+<div id="loading"></div>
+</body>
 </html>
