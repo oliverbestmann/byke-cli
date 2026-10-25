@@ -40,7 +40,7 @@ func (c *BuildCmd) Run() error {
 		return err
 	}
 
-	projectRoot = ensureGoProject(projectRoot)
+	ensureGoProject(projectRoot)
 
 	if c.Clean {
 		cleanDist(projectRoot)
@@ -71,7 +71,7 @@ func (c *BuildWebCmd) Run() error {
 		return err
 	}
 
-	projectRoot = ensureGoProject(projectRoot)
+	ensureGoProject(projectRoot)
 
 	if c.Clean {
 		cleanDist(projectRoot)
@@ -92,7 +92,7 @@ func (c *PgoCmd) Run() error {
 		return err
 	}
 
-	projectRoot = ensureGoProject(projectRoot)
+	ensureGoProject(projectRoot)
 
 	// write to a temporary file first, so a failed run keeps the previous profile
 	profile := filepath.Join(projectRoot, "default.pgo")
@@ -127,7 +127,7 @@ func (c *ServeWebCmd) Run() error {
 		return err
 	}
 
-	projectRoot = ensureGoProject(projectRoot)
+	ensureGoProject(projectRoot)
 
 	outDir := filepath.Join(projectRoot, "dist", "wasm")
 
@@ -222,7 +222,9 @@ func main() {
 	ctx.FatalIfErrorf(err)
 }
 
-func ensureGoProject(start string) string {
+// ensureGoProject exits unless start is inside a Go module. Commands still build
+// the package in start, so this works for examples in a module subdirectory.
+func ensureGoProject(start string) {
 	current, err := filepath.Abs(start)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "error:", err)
@@ -231,7 +233,7 @@ func ensureGoProject(start string) string {
 
 	for {
 		if _, err := os.Stat(filepath.Join(current, "go.mod")); err == nil {
-			return current
+			return
 		}
 
 		parent := filepath.Dir(current)
