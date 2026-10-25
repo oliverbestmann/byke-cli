@@ -47,6 +47,11 @@
         async function main() {
             const go = new Go();
 
+            // query parameters become environment variables, e.g. ?PUFFIN_ENABLED=1
+            for (const [key, value] of new URLSearchParams(location.search)) {
+                go.env[key] = value;
+            }
+
             WebAssembly.instantiateStreaming(fetch("main.wasm"), go.importObject).then(async (result) => {
                 wasm = result;
                 await go.run(result.instance);
