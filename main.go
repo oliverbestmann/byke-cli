@@ -48,11 +48,11 @@ func (c *BuildCmd) Run() error {
 
 	goos := c.GOOS
 	if goos == "" {
-		goos = goEnv(projectRoot, "GOOS")
+		goos = toolEnv(projectRoot, "go", "GOOS")
 	}
 	goarch := c.GOARCH
 	if goarch == "" {
-		goarch = goEnv(projectRoot, "GOARCH")
+		goarch = toolEnv(projectRoot, "go", "GOARCH")
 	}
 
 	buildNative(projectRoot, goos, goarch, c.UseZig)
@@ -63,6 +63,7 @@ func (c *BuildCmd) Run() error {
 type BuildWebCmd struct {
 	Clean       bool `help:"Remove dist before building."`
 	SkipWasmOpt bool `name:"skip-wasm-opt" help:"Do not optimize main.wasm with wasm-opt."`
+	TinyGo      bool `name:"tinygo" help:"Build with TinyGo. Needs the fork at github.com/oliverbestmann/tinygo."`
 }
 
 func (c *BuildWebCmd) Run() error {
@@ -77,7 +78,7 @@ func (c *BuildWebCmd) Run() error {
 		cleanDist(projectRoot)
 	}
 
-	buildWasm(projectRoot, !c.SkipWasmOpt)
+	buildWasm(projectRoot, !c.SkipWasmOpt, c.TinyGo)
 
 	return nil
 }
@@ -119,6 +120,7 @@ func (c *PgoCmd) Run() error {
 type ServeWebCmd struct {
 	Addr    string `help:"Address to serve HTTP on." default:"localhost:8080"`
 	TLSAddr string `name:"tls-addr" help:"Address to serve HTTPS on, with a self-signed certificate." default:"localhost:8443"`
+	TinyGo  bool   `name:"tinygo" help:"Build with TinyGo. Needs the fork at github.com/oliverbestmann/tinygo."`
 }
 
 func (c *ServeWebCmd) Run() error {
@@ -145,7 +147,7 @@ func (c *ServeWebCmd) Run() error {
 			fmt.Printf("Building wasm for %s\n", r.URL.Path)
 
 			// skip wasm-opt to keep reloads fast
-			if err := buildWasmErr(projectRoot, false); err != nil {
+			if err := buildWasmErr(projectRoot, false, c.TinyGo); err != nil {
 				http.Error(w, fmt.Sprintf("build failed: %v", err), http.StatusInternalServerError)
 				return
 			}
@@ -262,9 +264,9 @@ func checkRun(cmd []string, cwd string, env []string) {
 	}
 }
 
-// goEnv runs in projectRoot so the same toolchain is selected as for the build.
-func goEnv(projectRoot, name string) string {
-	cmd := exec.Command("go", "env", name)
+// toolEnv runs "tool env name" in projectRoot so the same toolchain is selected as for the build.
+func toolEnv(projectRoot, tool, name string) string {
+	cmd := exec.Command(tool, "env", name)
 	cmd.Dir = projectRoot
 	out, err := cmd.Output()
 	if err != nil {
@@ -385,14 +387,22 @@ func buildNative(projectRoot, goos, goarch string, useZig bool) {
 	}
 }
 
-func buildWasm(projectRoot string, optimize bool) {
-	if err := buildWasmErr(projectRoot, optimize); err != nil {
+func buildWasm(projectRoot string, optimize, tinygo bool) {
+	if err := buildWasmErr(projectRoot, optimize, tinygo); err != nil {
 		fmt.Fprintln(os.Stderr, "error:", err)
 		os.Exit(1)
 	}
 }
 
-func buildWasmErr(projectRoot string, optimize bool) error {
+// tinygoTarget is the TinyGo wasm target with simd enabled.
+const tinygoTarget = `{
+	"inherits": ["wasm"],
+	"features": "+bulk-memory,+bulk-memory-opt,+call-indirect-overlong,+mutable-globals,+nontrapping-fptoint,+sign-ext,+simd128,-multivalue,-reference-types",
+	"cflags": ["-msimd128"]
+}
+`
+
+func buildWasmErr(projectRoot string, optimize, tinygo bool) error {
 	outDir := filepath.Join(projectRoot, "dist", "wasm")
 	if err := os.MkdirAll(outDir, 0o755); err != nil {
 		return err
@@ -404,30 +414,55 @@ func buildWasmErr(projectRoot string, optimize bool) error {
 	env = setEnv(env, "CGO_ENABLED", "0")
 
 	mainWasm := filepath.Join(outDir, "main.wasm")
+
+	// enable the wasm features the Go compiler emits, so wasm-opt accepts the input,
+	// and simd so wasm-opt may use it
+	buildCmd := []string{"go", "build", "-o", mainWasm, "."}
+	optCmd := []string{
+		"wasm-opt", "-O2",
+		"--enable-bulk-memory", "--enable-nontrapping-float-to-int", "--enable-sign-ext", "--enable-simd",
+		mainWasm, "-o", mainWasm,
+	}
+
+	var wasmExec string
+	if tinygo {
+		// outside dist/wasm, so it is not served
+		target := filepath.Join(projectRoot, "dist", "tinygo-wasm-simd.json")
+		if err := os.WriteFile(target, []byte(tinygoTarget), 0o644); err != nil {
+			return err
+		}
+
+		// nosimd: TinyGo does not implement simd/archsimd, which byke glm uses with Go 1.27's default goexperiment.simd
+		buildCmd = []string{
+			"tinygo", "build", "-no-debug", "-fatal-runtime-errors", "-opt=3", "-tags=nosimd",
+			"-target", target, "-o", mainWasm, ".",
+		}
+
+		optCmd = []string{
+			"wasm-opt", "-O3", "--strip-debug", "--strip-producers",
+			"--enable-bulk-memory", "--enable-bulk-memory-opt", "--enable-mutable-globals",
+			"--enable-nontrapping-float-to-int", "--enable-sign-ext", "--enable-simd",
+			mainWasm, "-o", mainWasm,
+		}
+
+		wasmExec = filepath.Join(toolEnv(projectRoot, "tinygo", "TINYGOROOT"), "targets", "wasm_exec.js")
+	} else {
+		wasmExec = filepath.Join(toolEnv(projectRoot, "go", "GOROOT"), "lib", "wasm", "wasm_exec.js")
+	}
+
 	fmt.Println("Building application")
-	if err := run([]string{"go", "build", "-o", mainWasm, "."}, projectRoot, env); err != nil {
+	if err := run(buildCmd, projectRoot, env); err != nil {
 		return err
 	}
 
 	if optimize {
 		fmt.Println("Optimizing wasm")
-
-		// enable the wasm features the Go compiler emits, so wasm-opt accepts the input,
-		// and simd so wasm-opt may use it
-		cmd := []string{
-			"wasm-opt", "-O2",
-			"--enable-bulk-memory", "--enable-nontrapping-float-to-int", "--enable-sign-ext", "--enable-simd",
-			mainWasm, "-o", mainWasm,
-		}
-		if err := run(cmd, projectRoot, env); err != nil {
+		if err := run(optCmd, projectRoot, env); err != nil {
 			return fmt.Errorf("wasm-opt: %w", err)
 		}
 	}
 
-	goroot := goEnv(projectRoot, "GOROOT")
-
 	fmt.Println("Copy helper files")
-	wasmExec := filepath.Join(goroot, "lib", "wasm", "wasm_exec.js")
 	if err := copyFile(wasmExec, filepath.Join(outDir, "wasm_exec.js"), 0o644); err != nil {
 		return err
 	}

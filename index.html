@@ -47,13 +47,16 @@
         async function main() {
             const go = new Go();
 
-            // query parameters become environment variables, e.g. ?PUFFIN_ENABLED=1
-            for (const [key, value] of new URLSearchParams(location.search)) {
+            // query parameters become environment variables, e.g. ?PUFFIN_ENABLED=1.
+            // TinyGo's wasm_exec.js has no env.
+            for (const [key, value] of go.env ? new URLSearchParams(location.search) : []) {
                 go.env[key] = value;
             }
 
             WebAssembly.instantiateStreaming(fetch("main.wasm"), go.importObject).then(async (result) => {
-                wasm = result;
+                // TinyGo exports the memory as "memory", the webgpu bindings expect Go's "mem"
+                const exports = result.instance.exports;
+                wasm = exports.mem ? result : {module: result.module, instance: {exports: {...exports, mem: exports.memory}}};
                 await go.run(result.instance);
             });
         }
